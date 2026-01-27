@@ -1,107 +1,56 @@
 import express from "express";
 import fetch from "node-fetch";
+import crypto from "crypto"; // Для создания хеша, если обычный пароль не пройдет
 
 const app = express();
 
-const UPSTREAM = process.env.NIGHTSCOUT_URL; 
-const API_SECRET = process.env.NS_API_SECRET || "";
+// ПРЯМЫЕ НАСТРОЙКИ (раз переменные подводят)
+const UPSTREAM = "https://thomasns.up.railway.app"; 
+const SECRET = "alaBama1alaBama1"; 
 
-if (!UPSTREAM) {
-  console.error("CRITICAL ERROR: NIGHTSCOUT_URL is not defined!");
-  process.exit(1);
-}
+// Создаем SHA-1 хеш от секрета (Nightscout это любит)
+const API_SECRET_HASH = crypto.createHash('sha1').update(SECRET).digest('hex');
 
-// Вспомогательная функция для заголовков ответа (чтобы iOS не блокировала данные)
-const setResponseHeaders = (res) => {
-  res.set({
-    "Content-Type": "application/json; charset=utf-8",
-    "Cache-Control": "no-store, no-cache, must-revalidate",
-    "Pragma": "no-cache",
-    "Access-Control-Allow-Origin": "*"
-  });
-};
+app.get("/api/v1/entries.json", async (req, res) => {
+    try {
+        const url = new URL("/api/v1/entries.json", UPSTREAM);
+        
+        // Берем 50 записей и принудительно свежие
+        url.searchParams.set("count", "50");
+        url.searchParams.set("token", SECRET); // Пробуем токен
 
-async function proxy(req, res, path) {
-  try {
-    const url = new URL(path, UPSTREAM);
-    
-    // 1. ПЕРЕНОСИМ ПАРАМЕТРЫ И ЧИНИМ БАГ COUNT
-    // В ваших логах iOS присылает count=-29330834, что ломает ответ.
-    Object.keys(req.query).forEach(key => {
-      url.searchParams.set(key, req.query[key]);
-    });
+        console.log(`[Requesting] ${url.origin}${url.pathname}`);
 
-    const countParam = parseInt(req.query.count);
-    if (isNaN(countParam) || countParam <= 0 || countParam > 1000) {
-      // Если DiaBox прислал бред, принудительно просим последние 50 записей
-      url.searchParams.set("count", "50");
+        const response = await fetch(url.toString(), {
+            headers: { 
+                "Accept": "application/json",
+                "api-secret": SECRET, // Обычный секрет
+                "api-secret-hash": API_SECRET_HASH // Хеш на всякий случай
+            }
+        });
+
+        if (!response.ok) {
+            console.error(`[NS Error] ${response.status}`);
+            return res.status(response.status).json({ error: "NS Auth Failed" });
+        }
+
+        let data = await response.json();
+        
+        // Сортируем от новых к старым, чтобы DiaBox не брал декабрь
+        if (Array.isArray(data)) {
+            data.sort((a, b) => b.date - a.date);
+            console.log(`[Success] Sent ${data.length} entries. Latest: ${new Date(data[0].date).toLocaleString()}`);
+        }
+
+        res.set("Access-Control-Allow-Origin", "*");
+        return res.json(data);
+    } catch (e) {
+        return res.status(500).json({ error: e.message });
     }
-
-    // 2. АВТОРИЗАЦИЯ
-    // Используем самый надежный метод для токенов и секретов
-    url.searchParams.set("token", API_SECRET);
-
-    const fetchOptions = {
-      method: "GET",
-      headers: {
-        "Accept": "application/json",
-        "api-secret": API_SECRET 
-      }
-    };
-
-    console.log(`[Request]: ${url.origin}${url.pathname}?count=${url.searchParams.get("count")}`);
-
-    const response = await fetch(url.toString(), fetchOptions);
-    
-    setResponseHeaders(res);
-    res.status(response.status);
-
-    if (!response.ok) {
-      const errText = await response.text();
-      return res.send(errText);
-    }
-
-    let data = await response.json();
-
-    // 3. ПРОВЕРКА НА ПУСТОЙ ОТВЕТ (как в ваших логах)
-    // Если массив пустой, делаем вторую попытку без фильтров даты
-    if (Array.isArray(data) && data.length === 0) {
-      console.log("Empty response received. Retrying with fallback...");
-      const fallbackUrl = new URL(path, UPSTREAM);
-      fallbackUrl.searchParams.set("count", "20");
-      fallbackUrl.searchParams.set("token", API_SECRET);
-      
-      const retryResponse = await fetch(fallbackUrl.toString(), fetchOptions);
-      data = await retryResponse.json();
-    }
-
-    // Отдаем "сырой" JSON без фильтрации cleanEntry, 
-    // так как DiaBox 2.2 может требовать специфические поля.
-    return res.json(data);
-
-  } catch (error) {
-    console.error("Proxy Error:", error.message);
-    setResponseHeaders(res);
-    return res.status(500).json({ error: "Internal Proxy Error", details: error.message });
-  }
-}
-
-// Роуты для DiaBox
-app.get("/api/v1/entries.json", (req, res) => proxy(req, res, "/api/v1/entries.json"));
-app.get("/api/v1/entries", (req, res) => proxy(req, res, "/api/v1/entries"));
-
-// Проверка статуса в браузере
-app.get("/", (_req, res) => {
-  setResponseHeaders(res);
-  res.json({ 
-    status: "working", 
-    target: UPSTREAM,
-    info: "Use this URL in DiaBox settings" 
-  });
 });
+
+// Дублируем для другого пути
+app.get("/api/v1/entries", (req, res) => res.redirect("/api/v1/entries.json"));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => {
-  console.log(`✅ Server is up on port ${PORT}`);
-  console.log(`🔗 Proxying to: ${UPSTREAM}`);
-});
+app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
