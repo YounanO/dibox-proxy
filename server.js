@@ -1,56 +1,55 @@
 import express from "express";
 import fetch from "node-fetch";
-import crypto from "crypto"; // Для создания хеша, если обычный пароль не пройдет
 
 const app = express();
 
-// ПРЯМЫЕ НАСТРОЙКИ (раз переменные подводят)
-const UPSTREAM = "https://thomasns.up.railway.app"; 
-const SECRET = "alaBama1alaBama1"; 
+const UPSTREAM = process.env.NIGHTSCOUT_URL;
+const TOKEN = process.env.NS_API_SECRET; // Сюда вы вставили токен в Railway
 
-// Создаем SHA-1 хеш от секрета (Nightscout это любит)
-const API_SECRET_HASH = crypto.createHash('sha1').update(SECRET).digest('hex');
+async function proxy(req, res) {
+  try {
+    // Формируем URL. Если это токен (длинная строка), Nightscout ждет его в параметре 'token'
+    const url = new URL("/api/v1/entries.json", UPSTREAM);
+    url.searchParams.set("count", "50");
+    url.searchParams.set("token", TOKEN); // Прямая передача токена в строке запроса
 
-app.get("/api/v1/entries.json", async (req, res) => {
-    try {
-        const url = new URL("/api/v1/entries.json", UPSTREAM);
-        
-        // Берем 50 записей и принудительно свежие
-        url.searchParams.set("count", "50");
-        url.searchParams.set("token", SECRET); // Пробуем токен
+    console.log(`[Fetching] Requesting data with token...`);
 
-        console.log(`[Requesting] ${url.origin}${url.pathname}`);
+    const response = await fetch(url.toString(), {
+      method: "GET",
+      headers: {
+        "Accept": "application/json",
+        // Дополнительный способ передачи для новых версий NS
+        "Authorization": `Bearer ${TOKEN}`
+      }
+    });
 
-        const response = await fetch(url.toString(), {
-            headers: { 
-                "Accept": "application/json",
-                "api-secret": SECRET, // Обычный секрет
-                "api-secret-hash": API_SECRET_HASH // Хеш на всякий случай
-            }
-        });
-
-        if (!response.ok) {
-            console.error(`[NS Error] ${response.status}`);
-            return res.status(response.status).json({ error: "NS Auth Failed" });
-        }
-
-        let data = await response.json();
-        
-        // Сортируем от новых к старым, чтобы DiaBox не брал декабрь
-        if (Array.isArray(data)) {
-            data.sort((a, b) => b.date - a.date);
-            console.log(`[Success] Sent ${data.length} entries. Latest: ${new Date(data[0].date).toLocaleString()}`);
-        }
-
-        res.set("Access-Control-Allow-Origin", "*");
-        return res.json(data);
-    } catch (e) {
-        return res.status(500).json({ error: e.message });
+    if (!response.ok) {
+      console.error(`[Error] NS responded with ${response.status}`);
+      return res.status(response.status).json({ 
+        error: "Still Unauthorized", 
+        check: "Make sure the token in Railway variables has no spaces and is correct." 
+      });
     }
-});
 
-// Дублируем для другого пути
-app.get("/api/v1/entries", (req, res) => res.redirect("/api/v1/entries.json"));
+    const data = await response.json();
+    
+    // Сортировка (чтобы точно не видеть декабрь)
+    if (Array.isArray(data)) {
+      data.sort((a, b) => b.date - a.date);
+    }
+
+    res.set("Access-Control-Allow-Origin", "*");
+    return res.json(data);
+
+  } catch (error) {
+    return res.status(500).json({ error: error.message });
+  }
+}
+
+app.get("/api/v1/entries.json", proxy);
+app.get("/api/v1/entries", proxy);
+app.get("/", (req, res) => res.send("Proxy is waiting for valid token."));
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Proxy running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server started`));
