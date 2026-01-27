@@ -1,5 +1,7 @@
 import express from "express";
 import fetch from "node-fetch";
+import crypto from "crypto";
+
 
 const app = express();
 
@@ -13,7 +15,16 @@ if (!UPSTREAM) {
 
 const headersUp = () => {
   const h = { "Accept": "application/json" };
-  if (API_SECRET) h["Authorization"] = `Bearer ${API_SECRET}`;
+
+  if (API_SECRET) {
+    const md5 = crypto
+      .createHash("md5")
+      .update(API_SECRET)
+      .digest("hex");
+
+    h["Authorization"] = `Bearer ${md5}`;
+  }
+
   return h;
 };
 
