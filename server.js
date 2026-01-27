@@ -8,40 +8,40 @@ const UPSTREAM = process.env.NIGHTSCOUT_URL;
 const API_SECRET = process.env.NS_API_SECRET || "";
 
 if (!UPSTREAM) {
-  console.error("CRITICAL: Missing NIGHTSCOUT_URL");
+  console.error("Missing NIGHTSCOUT_URL");
   process.exit(1);
 }
 
-// Nightscout требует SHA1 для создания токена авторизации
+// Функция для SHA1 (Стандарт Nightscout)
 const getSHA1 = (text) => crypto.createHash("sha1").update(text).digest("hex");
 
-const getHeaders = () => {
-  const headers = {
-    "Accept": "application/json",
-    "Content-Type": "application/json"
-  };
-
+const headersUp = () => {
+  const h = { "Accept": "application/json" };
   if (API_SECRET) {
-    const hash = getSHA1(API_SECRET);
-    // Отправляем оба варианта для максимальной совместимости
-    headers["api-secret"] = API_SECRET;           // Прямой секрет
-    headers["Authorization"] = `Bearer ${hash}`;  // Хешированный токен
+    const sha1 = getSHA1(API_SECRET);
+    // Отправляем все возможные варианты, чтобы точно сработало
+    h["api-secret"] = API_SECRET;             // Прямой текст
+    h["Authorization"] = `Bearer ${sha1}`;    // SHA1 Bearer
   }
+  return h;
+};
 
-  return headers;
+const headersDown = (res) => {
+  res.set({
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store, no-cache, must-revalidate",
+    "Pragma": "no-cache"
+  });
 };
 
 const cleanEntry = (e) => ({
   _id: e._id,
   date: e.date,
-  dateString: e.dateString,
   sgv: e.sgv,
   delta: e.delta,
   direction: e.direction,
   type: e.type,
   device: e.device,
-  sysTime: e.sysTime,
-  utcOffset: e.utcOffset,
   mills: e.mills ?? e.date
 });
 
@@ -49,60 +49,48 @@ async function proxy(req, res, path) {
   try {
     const url = new URL(path, UPSTREAM);
     
-    // Копируем все query-параметры из входящего запроса (count, find, и т.д.)
-    Object.keys(req.query).forEach(key => {
-      url.searchParams.set(key, req.query[key]);
-    });
+    // Переносим параметры поиска (count и т.д.)
+    Object.keys(req.query).forEach(key => url.searchParams.set(key, req.query[key]));
 
-    // Добавляем токен в URL как запасной вариант (для DiaBox это часто критично)
+    // Добавляем SHA1 токен прямо в URL (запасной путь для старых клиентов)
     if (API_SECRET) {
       url.searchParams.set("token", getSHA1(API_SECRET));
     }
 
-    const response = await fetch(url.toString(), {
-      method: "GET",
-      headers: getHeaders()
-    });
+    const r = await fetch(url.toString(), { headers: headersUp() });
+    const text = await r.text();
 
-    // Прокидываем статус ответа
-    res.status(response.status);
-    res.set({
-      "Cache-Control": "no-store, no-cache, must-revalidate",
-      "Pragma": "no-cache",
-      "Content-Type": "application/json; charset=utf-8"
-    });
+    headersDown(res);
+    res.status(r.status);
 
-    if (!response.ok) {
-      const errorText = await response.text();
-      return res.send(errorText);
+    if (r.ok && path.includes("entries")) {
+      try {
+        const data = JSON.parse(text);
+        return res.send(JSON.stringify(Array.isArray(data) ? data.map(cleanEntry) : data));
+      } catch (e) {
+        return res.send(text);
+      }
     }
-
-    const data = await response.json();
-
-    // Если это запрос записей и пришел массив — чистим его
-    if (path.includes("entries") && Array.isArray(data)) {
-      return res.json(data.map(cleanEntry));
-    }
-
-    return res.json(data);
-
-  } catch (error) {
-    console.error("Proxy Error:", error.message);
-    return res.status(500).json({ error: "Proxy error", message: error.message });
+    return res.send(text);
+  } catch (e) {
+    headersDown(res);
+    return res.status(500).send(JSON.stringify({ error: String(e) }));
   }
 }
 
-// Роуты
 app.get("/api/v1/entries.json", (req, res) => proxy(req, res, "/api/v1/entries.json"));
 app.get("/api/v1/entries", (req, res) => proxy(req, res, "/api/v1/entries"));
 
 app.get("/", (_req, res) => {
-  res.json({ status: "ok", proxy: "DiaBox Helper", upstream: UPSTREAM });
+  headersDown(res);
+  res.send(JSON.stringify({ status: "ok", mode: "DiaBox Proxy" }));
 });
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`✅ DiaBox Proxy running on port ${PORT}`);
-  console.log(`🔗 Upstream: ${UPSTREAM}`);
-  console.log(`🔑 Auth: ${API_SECRET ? "Enabled (SHA1)" : "Disabled"}`);
+  console.log(`🚀 Proxy started on port ${PORT}`);
+  if (API_SECRET) {
+    console.log(`✅ SHA1 Hash: ${getSHA1(API_SECRET)}`);
+    console.log(`ℹ️ Сравните этот хеш с разделом "Subject Extras" в вашем Nightscout`);
+  }
 });
