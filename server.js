@@ -2,11 +2,10 @@ import express from "express";
 import fetch from "node-fetch";
 import crypto from "crypto";
 
-
 const app = express();
 
-const UPSTREAM = process.env.NIGHTSCOUT_URL;
-const API_SECRET = process.env.NS_API_SECRET || "";
+const UPSTREAM = process.env.NIGHTSCOUT_URL;          // https://thomasns.up.railway.app
+const API_SECRET = process.env.NS_API_SECRET || "";   // тот же, что API_SECRET в Nightscout (обычный текст)
 
 if (!UPSTREAM) {
   console.error("Missing NIGHTSCOUT_URL");
@@ -14,15 +13,14 @@ if (!UPSTREAM) {
 }
 
 const headersUp = () => {
-  const h = { "Accept": "application/json" };
+  const h = { Accept: "application/json" };
 
   if (API_SECRET) {
-    const md5 = crypto
-      .createHash("md5")
-      .update(API_SECRET)
-      .digest("hex");
+    const md5 = crypto.createHash("md5").update(API_SECRET).digest("hex");
 
-    h["Authorization"] = `Bearer ${md5}`;
+    // пробуем всё сразу
+    h["Authorization"] = `Bearer ${md5}`; // некоторые Nightscout принимают так
+    h["api-secret"] = API_SECRET;         // старый fallback
   }
 
   return h;
@@ -31,6 +29,7 @@ const headersUp = () => {
 const headersDown = (res) => {
   res.set("Content-Type", "application/json; charset=utf-8");
   res.set("Cache-Control", "no-store");
+  res.set("Pragma", "no-cache");
 };
 
 const cleanEntry = (e) => ({
@@ -50,11 +49,18 @@ const cleanEntry = (e) => ({
 async function proxy(req, res, path) {
   try {
     const url = new URL(path, UPSTREAM);
+
+    // пробрасываем query-параметры
     for (const [k, v] of Object.entries(req.query)) {
-      url.searchParams.set(k, v);
+      url.searchParams.set(k, String(v));
     }
 
-    const r = await fetch(url, { headers: headersUp() });
+    // ещё один fallback — token в query
+    if (API_SECRET) {
+      url.searchParams.set("token", API_SECRET);
+    }
+
+    const r = await fetch(url.toString(), { headers: headersUp() });
     const text = await r.text();
 
     headersDown(res);
@@ -68,19 +74,14 @@ async function proxy(req, res, path) {
     return res.send(text);
   } catch (e) {
     headersDown(res);
-    res.status(500).send(JSON.stringify({ error: String(e) }));
+    return res.status(500).send(JSON.stringify({ error: String(e) }));
   }
 }
 
-app.get("/api/v1/entries.json", (req, res) =>
-  proxy(req, res, "/api/v1/entries.json")
-);
-
+app.get("/api/v1/entries.json", (req, res) => proxy(req, res, "/api/v1/entries.json"));
 app.get("/", (_req, res) => {
   headersDown(res);
   res.send(JSON.stringify({ ok: true }));
 });
 
-app.listen(process.env.PORT || 3000, () =>
-  console.log("DiaBox proxy started")
-);
+app.listen(process.env.PORT || 3000, () => console.log("DiaBox proxy started"));
