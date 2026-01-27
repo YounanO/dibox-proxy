@@ -56,9 +56,14 @@ async function proxy(req, res, path) {
     }
 
     // ещё один fallback — token в query
-    if (API_SECRET) {
-      url.searchParams.set("token", API_SECRET);
-    }
+if (API_SECRET) {
+  const token = crypto
+    .createHash("md5")
+    .update(API_SECRET)
+    .digest("hex");
+
+  url.searchParams.set("token", token);
+}
 
     const r = await fetch(url.toString(), { headers: headersUp() });
     const text = await r.text();
