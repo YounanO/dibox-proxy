@@ -1,4 +1,4 @@
-import express from "express";
+const express = require("express");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
@@ -15,10 +15,8 @@ function normalizeEntry(e) {
 
   if (ms == null) return null;
 
-  // Исправление удвоенной даты (35… → 17…)
   if (ms > 3000000000000) ms = Math.floor(ms / 2);
 
-  // Защита от будущего
   if (ms > now + 2 * 60 * 60 * 1000) {
     return null;
   }
@@ -53,7 +51,7 @@ async function forward(req, res) {
       return res.status(204).end();
     }
 
-    const targetUrl = new URL(req.originalUrl, TARGET_BASE).toString();
+    const targetUrl = TARGET_BASE + req.originalUrl;
 
     const upstream = await fetch(targetUrl, {
       method: req.method,
