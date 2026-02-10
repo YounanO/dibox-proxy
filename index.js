@@ -1,21 +1,21 @@
 const express = require("express");
+const crypto = require("crypto");
 
 const app = express();
 app.use(express.json({ limit: "2mb" }));
 
-// Куда форвардим (твой Nightscout)
 const TARGET_BASE = process.env.TARGET_BASE || "https://thomasns.up.railway.app";
 
-// Секреты:
-// - INBOUND_SECRET: что GuardianMonitor шлёт в прокладку
-// - OUTBOUND_SECRET: что прокладка шлёт в Nightscout
-const INBOUND_SECRET = process.env.INBOUND_SECRET || "";
-const OUTBOUND_SECRET = process.env.OUTBOUND_SECRET || "";
+// Входной секрет (GuardianMonitor -> proxy)
+const INBOUND_SECRET = process.env.INBOUND_SECRET || "";   // можно оставить пустым = без проверки
+// Выходной секрет (proxy -> Nightscout)
+const OUTBOUND_SECRET = process.env.OUTBOUND_SECRET || ""; // это ТВОЙ nightscout secret (как в Nightscout)
 
-// ===== Helpers =====
+function sha1(s) {
+  return crypto.createHash("sha1").update(String(s)).digest("hex");
+}
 
 function extractIncomingSecret(req) {
-  // Популярные варианты: api-secret / x-api-secret / Authorization: Bearer ...
   const h = req.headers;
 
   let v =
@@ -26,11 +26,18 @@ function extractIncomingSecret(req) {
 
   v = String(v);
 
-  if (v.toLowerCase().startsWith("bearer ")) {
-    v = v.slice(7);
-  }
-
+  if (v.toLowerCase().startsWith("bearer ")) v = v.slice(7);
   return v.trim();
+}
+
+function inboundAuthorized(req) {
+  if (!INBOUND_SECRET) return true; // если не задан — пропускаем всё
+
+  const incoming = extractIncomingSecret(req);
+  if (!incoming) return false;
+
+  // Принимаем и plain, и sha1 от INBOUND_SECRET
+  return incoming === INBOUND_SECRET || incoming === sha1(INBOUND_SECRET);
 }
 
 function normalizeEntry(e) {
@@ -43,10 +50,10 @@ function normalizeEntry(e) {
 
   if (ms == null) return null;
 
-  // Исправление удвоенного timestamp (35… → 17…)
+  // Исправление удвоенной даты (35.. -> /2 -> 17..)
   if (ms > 3000000000000) ms = Math.floor(ms / 2);
 
-  // Защита от будущего (чтобы не портить Nightscout)
+  // Защита от будущего
   if (ms > now + 2 * 60 * 60 * 1000) return null;
 
   const iso = new Date(ms).toISOString();
@@ -62,60 +69,67 @@ function normalizeEntry(e) {
 }
 
 function normalizePayload(body) {
-  if (Array.isArray(body)) {
-    return body.map(normalizeEntry).filter(Boolean);
-  }
+  if (Array.isArray(body)) return body.map(normalizeEntry).filter(Boolean);
   const one = normalizeEntry(body);
   return one ? one : null;
 }
 
-// ===== Routes =====
-
+// health для проверки
 app.get("/health", (req, res) => res.json({ ok: true }));
 
-// Лёгкая диагностика: увидеть, какой секрет реально приходит от GuardianMonitor
-// (не показывает сам секрет, только факт и длину)
-app.get("/debug/secret", (req, res) => {
-  const s = extractIncomingSecret(req);
-  res.json({ hasSecret: Boolean(s), length: s.length });
-});
-
-async function forward(req, res) {
+// Универсальный прокси для Nightscout API
+app.all("/api/v1/*", async (req, res) => {
   try {
-    // 1) Проверяем INBOUND_SECRET (доступ к прокладке)
-    if (INBOUND_SECRET) {
-      const incoming = extractIncomingSecret(req);
-      if (incoming !== INBOUND_SECRET) {
-        return res.status(401).json({ error: "unauthorized" });
-      }
+    // 1) Авторизация к прокладке
+    if (!inboundAuthorized(req)) {
+      return res.status(401).json({ error: "unauthorized_proxy" });
     }
 
-    // 2) Чиним payload
-    const fixed = normalizePayload(req.body);
-    if (fixed == null || (Array.isArray(fixed) && fixed.length === 0)) {
-      return res.status(204).end();
+    // 2) Формируем URL на целевой Nightscout
+    const targetUrl = new URL(req.originalUrl, TARGET_BASE).toString();
+
+    // 3) Заголовки на апстрим
+    const headers = {};
+
+    // Прокидываем content-type только если есть тело
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      headers["content-type"] = "application/json";
     }
 
-    // 3) Форвардим в Nightscout с OUTBOUND_SECRET
-    const targetUrl = TARGET_BASE + req.originalUrl;
-
-    const headers = {
-      "content-type": "application/json",
-    };
-
-    // Nightscout обычно ждёт api-secret
+    // 4) Outbound api-secret: Nightscout обычно ждёт SHA1(secret)
+    // Если OUTBOUND_SECRET пустой — отправим без секрета (если у тебя NS открыт)
     if (OUTBOUND_SECRET) {
-      headers["api-secret"] = OUTBOUND_SECRET;
+      headers["api-secret"] = sha1(OUTBOUND_SECRET);
+    }
+
+    // 5) Тело запроса
+    let body;
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      // Если это записи — чиним даты
+      const isEntries =
+        req.path === "/api/v1/entries" ||
+        req.path === "/api/v1/entries.json" ||
+        req.path === "/api/v1/entries/sgv.json";
+
+      if (isEntries) {
+        const fixed = normalizePayload(req.body);
+        if (fixed == null || (Array.isArray(fixed) && fixed.length === 0)) {
+          return res.status(204).end();
+        }
+        body = JSON.stringify(fixed);
+      } else {
+        // для остальных POST/PUT просто форвардим как есть
+        body = JSON.stringify(req.body ?? {});
+      }
     }
 
     const upstream = await fetch(targetUrl, {
       method: req.method,
       headers,
-      body: JSON.stringify(fixed),
+      body,
     });
 
     const text = await upstream.text();
-
     res.status(upstream.status);
     res.set("content-type", upstream.headers.get("content-type") || "text/plain");
     return res.send(text);
@@ -123,17 +137,7 @@ async function forward(req, res) {
     console.error("Proxy error:", err);
     return res.status(500).json({ error: "proxy_failed", message: String(err?.message || err) });
   }
-}
-
-// Nightscout endpoints, которые обычно использует GuardianMonitor
-app.post("/api/v1/entries", forward);
-app.post("/api/v1/entries.json", forward);
-app.post("/api/v1/entries/sgv.json", forward);
-
-// На всякий случай (некоторые клиенты используют PUT)
-app.put("/api/v1/entries", forward);
-app.put("/api/v1/entries.json", forward);
-app.put("/api/v1/entries/sgv.json", forward);
+});
 
 const port = process.env.PORT || 3000;
 app.listen(port, () => {
